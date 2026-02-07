@@ -36,6 +36,7 @@ static void gst_libuvc_h264_src_set_property(GObject *object, guint prop_id,
                                              const GValue *value, GParamSpec *pspec);
 static void gst_libuvc_h264_src_get_property(GObject *object, guint prop_id,
                                              GValue *value, GParamSpec *pspec);
+static gboolean gst_libuvc_h264_set_clock(GstElement *element, GstClock *clock);
 static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src);
 static gboolean gst_libuvc_h264_src_stop(GstBaseSrc *src);
 static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf);
@@ -62,6 +63,7 @@ static void gst_libuvc_h264_src_class_init(GstLibuvcH264SrcClass *klass) {
   gst_element_class_add_pad_template(element_class,
     gst_static_pad_template_get(&src_template));
 
+  element_class->set_clock = gst_libuvc_h264_set_clock;
   base_src_class->start = gst_libuvc_h264_src_start;
   base_src_class->stop = gst_libuvc_h264_src_stop;
   push_src_class->create = gst_libuvc_h264_src_create;
@@ -191,9 +193,10 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
   self->uvc_ctx = NULL;
   self->uvc_dev = NULL;
   self->uvc_devh = NULL;
+  self->clock = NULL;
   self->frame_queue = g_async_queue_new();
   self->streaming = FALSE;
-  self->uvc_start_time = G_MAXUINT64;
+  self->base_time = G_MAXUINT64;
   self->prev_pts = G_MAXUINT64;
 
   // Initialization, not fixed
@@ -362,6 +365,27 @@ static void gst_libuvc_h264_src_get_property(GObject *object, guint prop_id,
   }
 }
 
+static gboolean gst_libuvc_h264_set_clock(GstElement *element, GstClock *clock) {
+  GstLibuvcH264Src *self = GST_LIBUVC_H264_SRC(element);
+
+  GST_OBJECT_LOCK(self);
+
+  if (self->clock) {
+    gst_object_unref(self->clock);
+    self->clock = NULL;
+  }
+
+  if (clock) {
+    self->clock = gst_object_ref(clock);
+    self->base_time = G_MAXUINT64;
+    self->prev_pts = G_MAXUINT64;
+  }
+
+  GST_OBJECT_UNLOCK(self);
+
+  return GST_ELEMENT_CLASS(gst_libuvc_h264_src_parent_class)->set_clock(element, clock);
+}
+
 static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
   GstLibuvcH264Src *self = GST_LIBUVC_H264_SRC(src);
   uvc_error_t res;
@@ -451,12 +475,14 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
     nal_unit_t units[MAX_UNITS_MAIN];
     int c = parse_nal_units(units, MAX_UNITS_MAIN, data, frame->data_bytes);
 
-    GstClockTime libuvc_ts = ((uint64_t)frame->capture_time_finished.tv_sec) * 1000L * 1000L * 1000L
-                             + frame->capture_time_finished.tv_nsec;
-    if (self->uvc_start_time == G_MAXUINT64) {
-        self->uvc_start_time = libuvc_ts;
+    if (!self->clock) return;
+    GstClockTime now = gst_clock_get_time(self->clock);
+
+    if (self->base_time == G_MAXUINT64) {
+        GstClockTime base_time = gst_element_get_base_time(GST_ELEMENT(self));
+        self->base_time = base_time;
     }
-    libuvc_ts -= self->uvc_start_time;
+    GstClockTime ts = now - self->base_time;
 
     for (int i = 0; i < c; i++) {
         nal_unit_t *unit = &units[i];
@@ -514,7 +540,7 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
             /* We skipped the initial non-IDR frames, so we need to add their
                duration to the output PTS when we get the first IDR frame */
             if (self->prev_pts == G_MAXUINT64) {
-                self->prev_pts = libuvc_ts - self->frame_interval;
+                self->prev_pts = ts - self->frame_interval;
             }
 
             // Average frame interval tracking
@@ -526,22 +552,22 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
                     #define AVG_MULT 1
                     #define AVG_ROUNDING (AVG_DIV/2)
 
-                    uint64_t interval = (libuvc_ts - self->prev_int_ts) / self->frame_count;
+                    uint64_t interval = (ts - self->prev_int_ts) / self->frame_count;
                     self->frame_interval = (self->frame_interval * (AVG_DIV-AVG_MULT) +
                                                 interval + AVG_ROUNDING) / AVG_DIV;
                 }
                 self->frame_count = 0;
-                self->prev_int_ts = libuvc_ts;
+                self->prev_int_ts = ts;
             }
 
             GstClockTime timestamp = self->prev_pts + self->frame_interval;
 
             /* Determine if we need to slightly speed up or slow down the PTSes
                to track the average libuvc timestamps */
-            /* Don't adjust the timestamps while we're reciving the first few
+            /* Don't adjust the timestamps while we're receiving the first few
                frames as the timing can be quite noisy */
             if (self->prev_int_ts != 0) {
-                int64_t diff = libuvc_ts - timestamp;
+                int64_t diff = ts - timestamp;
                 int64_t adj = 0;
                 // +/- 2-frame interval hysteresis
                 if (diff < (-2 * self->frame_interval) || diff > (2 * self->frame_interval)) {
@@ -571,15 +597,17 @@ static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf
   uvc_error_t res;
 
   if (!self->streaming) {
+    self->base_time = G_MAXUINT64;
+    self->prev_pts = G_MAXUINT64;
+    self->streaming = TRUE;
+
     // Start streaming
     res = uvc_start_streaming(self->uvc_devh, &self->uvc_ctrl, frame_callback, self, 0);
     if (res < 0) {
+      self->streaming = FALSE;
       GST_ERROR_OBJECT(self, "Unable to start streaming: %s", uvc_strerror(res));
       return GST_FLOW_ERROR;
     }
-    self->streaming = TRUE;
-	self->uvc_start_time = G_MAXUINT64;
-	self->prev_pts = G_MAXUINT64;
   }
 
   // Retrieve a buffer from the queue

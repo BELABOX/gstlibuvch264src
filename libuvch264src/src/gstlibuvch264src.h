@@ -29,7 +29,8 @@ struct _GstLibuvcH264Src {
   uvc_stream_ctrl_t uvc_ctrl;
   GAsyncQueue *frame_queue;
   gboolean streaming;
-  GstClockTime uvc_start_time;
+  GstClock *clock;
+  GstClockTime base_time;
   GstClockTime prev_pts;
   gint64 frame_interval; // in ns
   guint64 prev_int_ts;
