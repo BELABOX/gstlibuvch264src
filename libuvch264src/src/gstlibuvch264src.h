@@ -30,6 +30,8 @@ struct _GstLibuvcH264Src {
   GAsyncQueue *frame_queue;
   gboolean streaming;
   GstClock *clock;
+  int64_t pts_offset_sum;
+  int64_t pts_stretch;
   GstClockTime base_time;
   GstClockTime prev_pts;
   gint64 frame_interval; // in ns

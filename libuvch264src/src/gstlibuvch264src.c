@@ -379,6 +379,8 @@ static gboolean gst_libuvc_h264_set_clock(GstElement *element, GstClock *clock) 
     self->clock = gst_object_ref(clock);
     self->base_time = G_MAXUINT64;
     self->prev_pts = G_MAXUINT64;
+    self->pts_offset_sum = 0;
+    self->pts_stretch = 0;
   }
 
   GST_OBJECT_UNLOCK(self);
@@ -537,45 +539,69 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
                  and can drift over time
             */
 
-            /* We skipped the initial non-IDR frames, so we need to add their
-               duration to the output PTS when we get the first IDR frame */
+            // We'll set the first PTS to the current timestamp ts
             if (self->prev_pts == G_MAXUINT64) {
                 self->prev_pts = ts - self->frame_interval;
             }
 
-            // Average frame interval tracking
+            // Update the PTS calculation on the first IDR after MIN_FRAMES_CALC_INTERVAL frames
             self->frame_count++;
-            if (units[i].type == 5 && self->frame_count >= MIN_FRAMES_CALC_INTERVAL) {
-                // Throw away the first set results as they can be quite noisy
+            gboolean update_pts_calc = (units[i].type == 5 &&
+                                        self->frame_count >= MIN_FRAMES_CALC_INTERVAL);
+
+            int64_t timestamp_offset = 0;
+            if (update_pts_calc) {
+                // Discard the first set of results, as they can be quite noisy
                 if (self->prev_int_ts != 0) {
                     #define AVG_DIV 20
                     #define AVG_MULT 1
                     #define AVG_ROUNDING (AVG_DIV/2)
 
-                    uint64_t interval = (ts - self->prev_int_ts) / self->frame_count;
+                    #define CLOCK_START_LEN (MIN_FRAMES_CALC_INTERVAL * 3 * (uint64_t)self->frame_interval)
+                    #define PTS_JUMP_THRESHOLD (80L * 1000L * 1000L) // 80 ms
+                    #define PTS_STRETCH_HYST   (8L * 1000L * 1000L)  //  8 ms
+                    #define PTS_STRETCH_VAL    (50L * 1000L)         // 50 us (per frame)
+
+
+                    // Average frame interval tracking
+                    int64_t interval = ((ts - self->prev_int_ts) + self->frame_count / 2) / self->frame_count;
                     self->frame_interval = (self->frame_interval * (AVG_DIV-AVG_MULT) +
-                                                interval + AVG_ROUNDING) / AVG_DIV;
+                                            interval + AVG_ROUNDING) / AVG_DIV;
+
+
+                    // Determine if we need to resync the PTSes with the running clock
+                    int64_t avg_offset = (self->pts_offset_sum + self->frame_count/2) / self->frame_count;
+
+                    // Usually we don't need to stretch the frame interval
+                    self->pts_stretch = 0;
+
+                    /* After just starting, jump immediately to resync on delta longer than a frame interval.
+                       During normal execution, prefer gradual resync as it's less noticeable
+                       We've seen delta up to around 75ms caused by dropped frames on a Pocket 3 in 4K60 */
+                    if ((ts < CLOCK_START_LEN &&
+                        (avg_offset < -self->frame_interval || avg_offset > self->frame_interval)) ||
+                        avg_offset < -PTS_JUMP_THRESHOLD || avg_offset > PTS_JUMP_THRESHOLD) {
+                        timestamp_offset = avg_offset;
+
+                    // For smaller delta of +/- 8ms, slightly stretch or compress frame intervals to catch up
+                    } else if (avg_offset > PTS_STRETCH_HYST) {
+                        self->pts_stretch = PTS_STRETCH_VAL;
+
+                    } else if (avg_offset < -PTS_STRETCH_HYST) {
+                        self->pts_stretch = -PTS_STRETCH_VAL;
+
+                    }
                 }
+
+                // Reset all the counters regardless of whether the PTS calculations were updated
                 self->frame_count = 0;
+                self->pts_offset_sum = 0;
                 self->prev_int_ts = ts;
             }
 
-            GstClockTime timestamp = self->prev_pts + self->frame_interval;
-
-            /* Determine if we need to slightly speed up or slow down the PTSes
-               to track the average libuvc timestamps */
-            /* Don't adjust the timestamps while we're receiving the first few
-               frames as the timing can be quite noisy */
-            if (self->prev_int_ts != 0) {
-                int64_t diff = ts - timestamp;
-                int64_t adj = 0;
-                // +/- 2-frame interval hysteresis
-                if (diff < (-2 * self->frame_interval) || diff > (2 * self->frame_interval)) {
-                    adj = diff / 5;
-                    adj = CLAMP(diff, -self->frame_interval / 2, self->frame_interval / 2);
-                }
-                timestamp += adj;
-            }
+            GstClockTime timestamp = self->prev_pts + self->frame_interval + self->pts_stretch + timestamp_offset;
+            int64_t offset = ts - timestamp;
+            self->pts_offset_sum += offset;
 
             GST_BUFFER_PTS(buffer) = timestamp;
             GST_BUFFER_DTS(buffer) = timestamp;
@@ -599,6 +625,9 @@ static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf
   if (!self->streaming) {
     self->base_time = G_MAXUINT64;
     self->prev_pts = G_MAXUINT64;
+    self->pts_offset_sum = 0;
+    self->pts_stretch = 0;
+
     self->streaming = TRUE;
 
     // Start streaming
