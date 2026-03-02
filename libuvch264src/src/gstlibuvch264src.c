@@ -571,6 +571,9 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
 
                     // Determine if we need to resync the PTSes with the running clock
                     int64_t avg_offset = (self->pts_offset_sum + self->frame_count/2) / self->frame_count;
+                    GST_DEBUG_OBJECT(self, "measured frame interval %ld us, average interval %ld us, "
+                                           "average PTS offset: %ld us",
+                                           interval / 1000, self->frame_interval / 1000, avg_offset / 1000);
 
                     // Usually we don't need to stretch the frame interval
                     self->pts_stretch = 0;
@@ -582,13 +585,16 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
                         (avg_offset < -self->frame_interval || avg_offset > self->frame_interval)) ||
                         avg_offset < -PTS_JUMP_THRESHOLD || avg_offset > PTS_JUMP_THRESHOLD) {
                         timestamp_offset = avg_offset;
+                        GST_DEBUG_OBJECT(self, "  adjusting PTS offset by: %ld us", timestamp_offset / 1000);
 
                     // For smaller delta of +/- 8ms, slightly stretch or compress frame intervals to catch up
                     } else if (avg_offset > PTS_STRETCH_HYST) {
                         self->pts_stretch = PTS_STRETCH_VAL;
+                        GST_DEBUG_OBJECT(self, "  stretching PTS interval by: %ld us", self->pts_stretch / 1000);
 
                     } else if (avg_offset < -PTS_STRETCH_HYST) {
                         self->pts_stretch = -PTS_STRETCH_VAL;
+                        GST_DEBUG_OBJECT(self, "  compressing PTS interval by: %ld us", -self->pts_stretch / 1000);
 
                     }
                 }
@@ -606,6 +612,7 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
             GST_BUFFER_PTS(buffer) = timestamp;
             GST_BUFFER_DTS(buffer) = timestamp;
             GST_BUFFER_DURATION(buffer) = timestamp - self->prev_pts;
+            GST_LOG_OBJECT(self, "PTS %lu, offset %ld us", timestamp, offset / 1000);
 
             self->prev_pts = timestamp;
         }
